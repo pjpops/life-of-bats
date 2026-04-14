@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bat_sonar.py — Live bat sonogram viewer with BatDetect2 species detection.
+Life of Bats — Live bat sonogram viewer with BatDetect2 species detection.
 
 Connect your pippyg USB bat detector, select the device from the dropdown,
 and click Start. Clips are saved to recordings/ when ultrasonic energy is
@@ -219,7 +219,7 @@ def _save_and_analyse_worker():
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Bat Sonar — Live Sonogram")
+        self.setWindowTitle("Life of Bats")
         self.resize(1100, 860)
 
         # Audio stream
@@ -609,7 +609,7 @@ class MainWindow(QMainWindow):
 
         # Status bar
         self._sb = self.statusBar()
-        self._sb.showMessage("Ready — select your pippyg device and click Start")
+        self._sb.showMessage("Life of Bats — select your pippyg device and click Start")
         SIGNALS.status.connect(self._sb.showMessage)
 
     def _populate_devices(self):
