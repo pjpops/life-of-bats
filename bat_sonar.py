@@ -417,8 +417,12 @@ class MainWindow(QMainWindow):
 
         out_refresh_btn = QPushButton("↺")
         out_refresh_btn.setFixedWidth(28)
-        out_refresh_btn.setToolTip("Refresh output device list (e.g. after connecting AirPlay)")
-        out_refresh_btn.clicked.connect(self._refresh_output_devices)
+        out_refresh_btn.setToolTip(
+            "Restart audio output on the selected device.\n"
+            "For AirPlay/Sonos: first set it as your system output in\n"
+            "macOS System Settings → Sound → Output, then click here."
+        )
+        out_refresh_btn.clicked.connect(self._on_output_device_changed)
         row3.addWidget(out_refresh_btn)
 
         row3.addStretch()
@@ -617,17 +621,17 @@ class MainWindow(QMainWindow):
                 self._device_combo.addItem(f"[{i}] {badge}  {dev['name']}", i)
 
     def _populate_output_devices(self):
+        """Fill the output combo. 'System default' is always first so AirPlay
+        and other virtual macOS devices (which PortAudio cannot enumerate) are
+        reachable: set them as the macOS system output, then pick this entry."""
         self._out_combo.blockSignals(True)
         self._out_combo.clear()
-        default_idx = sd.default.device[1]   # system default output
+        # None = let PortAudio follow whatever macOS has set as system default
+        self._out_combo.addItem("System default  (use macOS Sound settings)", None)
         for i, dev in enumerate(sd.query_devices()):
             if dev["max_output_channels"] > 0:
-                label = f"{dev['name']}"
-                if i == default_idx:
-                    label += "  (system default)"
-                self._out_combo.addItem(label, i)
-                if i == default_idx:
-                    self._out_combo.setCurrentIndex(self._out_combo.count() - 1)
+                self._out_combo.addItem(dev["name"], i)
+        self._out_combo.setCurrentIndex(0)   # default to system default
         self._out_combo.blockSignals(False)
 
     def _refresh_output_devices(self):
@@ -636,16 +640,17 @@ class MainWindow(QMainWindow):
         for i in range(self._out_combo.count()):
             if self._out_combo.itemData(i) == prev:
                 self._out_combo.setCurrentIndex(i)
-                break
+                return
+        # If previous device no longer found, fall back to system default
+        self._out_combo.setCurrentIndex(0)
 
     def _on_output_device_changed(self, _index: int = 0):
-        device_idx = self._out_combo.currentData()
-        if device_idx is None:
-            return
-        self._restart_output_stream(device_idx)
+        self._restart_output_stream(self._out_combo.currentData())
 
     def _restart_output_stream(self, device_idx):
-        """Close the current output stream and reopen on device_idx."""
+        """Close the current output stream and reopen on device_idx.
+        Pass device_idx=None to target the macOS system default output,
+        which includes AirPlay and other virtual Core Audio devices."""
         if self._out_stream is not None:
             try:
                 self._out_stream.stop()
@@ -653,7 +658,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._out_stream = None
-        # Drain the queue so old audio doesn't play on the new device
+        # Drain stale audio so it doesn't burst through on the new device
         while not _out_q.empty():
             try:
                 _out_q.get_nowait()
@@ -661,7 +666,7 @@ class MainWindow(QMainWindow):
                 break
         try:
             self._out_stream = sd.OutputStream(
-                device=device_idx,
+                device=device_idx,   # None → system default (picks up AirPlay)
                 samplerate=OUTPUT_RATE,
                 channels=1,
                 dtype="float32",
@@ -669,8 +674,11 @@ class MainWindow(QMainWindow):
                 callback=self._output_callback,
             )
             self._out_stream.start()
-            dev_name = sd.query_devices(device_idx)["name"]
-            self._sb.showMessage(f"Audio output → {dev_name}")
+            if device_idx is None:
+                label = "system default"
+            else:
+                label = sd.query_devices(device_idx)["name"]
+            self._sb.showMessage(f"Audio output → {label}")
         except Exception as e:
             self._sb.showMessage(f"Output device error: {e}")
 
