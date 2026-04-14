@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
-from scipy.signal import resample_poly, butter, sosfilt, sosfilt_zi
+from scipy.signal import resample_poly, butter, sosfilt, sosfilt_zi, iirnotch
 from math import gcd
 
 # ── BatDetect2 path ────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ if _BD2_PATH not in sys.path:
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSplitter, QFileDialog, QSlider,
+    QHeaderView, QSplitter, QFileDialog, QSlider, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal, QObject
 from PyQt5.QtGui import QColor
@@ -240,6 +240,11 @@ class MainWindow(QMainWindow):
         self._volume        = [0.8]
         self._out_stream    = None
 
+        # Notch filter — suppresses a fixed-frequency interference tone
+        self._notch_enabled  = False
+        self._notch_freq_hz  = 58_000
+        self._notch_sos, self._notch_zi = self._build_notch(self._notch_freq_hz)
+
         self._is_playing    = False          # True while file playback is running
         self._playback_stop = threading.Event()  # set to abort playback
         self._last_detection_ts = ""        # timestamp of the most recent clip batch
@@ -375,6 +380,30 @@ class MainWindow(QMainWindow):
         self._vol_label = QLabel("80%")
         self._vol_label.setFixedWidth(36)
         row3.addWidget(self._vol_label)
+
+        row3.addSpacing(24)
+
+        self._notch_btn = QPushButton("Noise filter: off")
+        self._notch_btn.setCheckable(True)
+        self._notch_btn.setFixedWidth(120)
+        self._notch_btn.setToolTip(
+            "Narrow notch filter that removes a fixed-frequency interference tone\n"
+            "(e.g. USB switching noise, ultrasonic sensors).\n"
+            "Affects both the waterfall display and the audio output."
+        )
+        self._notch_btn.toggled.connect(self._toggle_notch)
+        row3.addWidget(self._notch_btn)
+
+        self._notch_spin = QDoubleSpinBox()
+        self._notch_spin.setRange(FREQ_MIN_HZ / 1000, FREQ_MAX_HZ / 1000)
+        self._notch_spin.setValue(self._notch_freq_hz / 1000)
+        self._notch_spin.setSuffix(" kHz")
+        self._notch_spin.setSingleStep(0.5)
+        self._notch_spin.setDecimals(1)
+        self._notch_spin.setFixedWidth(90)
+        self._notch_spin.setToolTip("Centre frequency of the noise notch filter")
+        self._notch_spin.valueChanged.connect(self._on_notch_freq_changed)
+        row3.addWidget(self._notch_spin)
 
         row3.addStretch()
         vbox.addLayout(row3)
@@ -633,6 +662,14 @@ class MainWindow(QMainWindow):
     # ── Audio callback (real-time thread) ─────────────────────────────────────
     def _audio_callback(self, indata, frames, time_info, status):
         chunk = indata[:, 0].copy()
+
+        # Apply notch filter before anything else so both the waterfall and
+        # the audio output see the suppressed signal
+        if self._notch_enabled:
+            chunk, self._notch_zi = sosfilt(
+                self._notch_sos, chunk.astype(np.float64), zi=self._notch_zi
+            )
+            chunk = chunk.astype(np.float32)
 
         # Push to spectrogram queue (non-blocking)
         try:
@@ -1038,6 +1075,30 @@ class MainWindow(QMainWindow):
     def _on_volume_changed(self, value: int):
         self._volume[0] = value / 100.0
         self._vol_label.setText(f"{value}%")
+
+    # ── Notch filter ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _build_notch(freq_hz: float):
+        """Return (sos, zi) for a narrow IIR notch at freq_hz."""
+        w0  = freq_hz / (SAMPLE_RATE / 2)
+        b, a = iirnotch(w0, Q=30)
+        # Pack into a single-section SOS row so we can use sosfilt with state
+        sos = np.array([[b[0], b[1], b[2], 1.0, a[1], a[2]]], dtype=np.float64)
+        zi  = sosfilt_zi(sos)
+        return sos, zi
+
+    def _toggle_notch(self, checked: bool):
+        self._notch_enabled = checked
+        if checked:
+            # Reset state so there's no click when the filter kicks in
+            _, self._notch_zi = self._build_notch(self._notch_freq_hz)
+            self._notch_btn.setText("Noise filter: on")
+        else:
+            self._notch_btn.setText("Noise filter: off")
+
+    def _on_notch_freq_changed(self, value: float):
+        self._notch_freq_hz = value * 1000
+        self._notch_sos, self._notch_zi = self._build_notch(self._notch_freq_hz)
 
     def _output_callback(self, outdata, frames, time_info, status):
         """Called by sounddevice in its output thread — must be fast."""
