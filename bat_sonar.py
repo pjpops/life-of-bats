@@ -138,7 +138,7 @@ SIGNALS = _Signals()
 _spec_q      : queue.Queue = queue.Queue(maxsize=1000)
 _clip_audio_q: queue.Queue = queue.Queue(maxsize=10)
 _hetero_q    : queue.Queue = queue.Queue(maxsize=200)   # raw chunks for heterodyne
-_out_q       : queue.Queue = queue.Queue(maxsize=200)   # decimated output chunks
+_out_q       : queue.Queue = queue.Queue(maxsize=600)   # large buffer for AirPlay latency
 
 
 # ── Worker: frequency division ────────────────────────────────────────────────
@@ -405,6 +405,22 @@ class MainWindow(QMainWindow):
         self._notch_spin.valueChanged.connect(self._on_notch_freq_changed)
         row3.addWidget(self._notch_spin)
 
+        row3.addSpacing(24)
+        row3.addWidget(QLabel("Out:"))
+
+        self._out_combo = QComboBox()
+        self._out_combo.setMinimumWidth(200)
+        self._out_combo.setToolTip("Audio output device — change to use AirPlay, Sonos, etc.")
+        self._populate_output_devices()
+        self._out_combo.currentIndexChanged.connect(self._on_output_device_changed)
+        row3.addWidget(self._out_combo)
+
+        out_refresh_btn = QPushButton("↺")
+        out_refresh_btn.setFixedWidth(28)
+        out_refresh_btn.setToolTip("Refresh output device list (e.g. after connecting AirPlay)")
+        out_refresh_btn.clicked.connect(self._refresh_output_devices)
+        row3.addWidget(out_refresh_btn)
+
         row3.addStretch()
         vbox.addLayout(row3)
 
@@ -600,6 +616,64 @@ class MainWindow(QMainWindow):
                 badge = "✓" if ok else "✗"
                 self._device_combo.addItem(f"[{i}] {badge}  {dev['name']}", i)
 
+    def _populate_output_devices(self):
+        self._out_combo.blockSignals(True)
+        self._out_combo.clear()
+        default_idx = sd.default.device[1]   # system default output
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_output_channels"] > 0:
+                label = f"{dev['name']}"
+                if i == default_idx:
+                    label += "  (system default)"
+                self._out_combo.addItem(label, i)
+                if i == default_idx:
+                    self._out_combo.setCurrentIndex(self._out_combo.count() - 1)
+        self._out_combo.blockSignals(False)
+
+    def _refresh_output_devices(self):
+        prev = self._out_combo.currentData()
+        self._populate_output_devices()
+        for i in range(self._out_combo.count()):
+            if self._out_combo.itemData(i) == prev:
+                self._out_combo.setCurrentIndex(i)
+                break
+
+    def _on_output_device_changed(self, _index: int = 0):
+        device_idx = self._out_combo.currentData()
+        if device_idx is None:
+            return
+        self._restart_output_stream(device_idx)
+
+    def _restart_output_stream(self, device_idx):
+        """Close the current output stream and reopen on device_idx."""
+        if self._out_stream is not None:
+            try:
+                self._out_stream.stop()
+                self._out_stream.close()
+            except Exception:
+                pass
+            self._out_stream = None
+        # Drain the queue so old audio doesn't play on the new device
+        while not _out_q.empty():
+            try:
+                _out_q.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._out_stream = sd.OutputStream(
+                device=device_idx,
+                samplerate=OUTPUT_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=_OUT_BLOCK,
+                callback=self._output_callback,
+            )
+            self._out_stream.start()
+            dev_name = sd.query_devices(device_idx)["name"]
+            self._sb.showMessage(f"Audio output → {dev_name}")
+        except Exception as e:
+            self._sb.showMessage(f"Output device error: {e}")
+
     def _refresh_devices(self):
         # Force PortAudio to rescan — without this it returns the cached list
         # from startup and newly plugged USB devices never appear.
@@ -607,22 +681,16 @@ class MainWindow(QMainWindow):
         # kill it, then restart it afterwards.
         if self._stream is None:
             try:
+                out_idx = self._out_combo.currentData()
                 if self._out_stream is not None:
                     self._out_stream.stop()
                     self._out_stream.close()
                     self._out_stream = None
                 sd._terminate()
                 sd._initialize()
-                self._out_stream = sd.OutputStream(
-                    samplerate=OUTPUT_RATE,
-                    channels=1,
-                    dtype="float32",
-                    blocksize=_OUT_BLOCK,
-                    callback=self._output_callback,
-                )
-                self._out_stream.start()
             except Exception:
                 pass
+            self._restart_output_stream(out_idx)
 
         prev = self._device_combo.currentData()
         self._populate_devices()
@@ -1124,18 +1192,8 @@ class MainWindow(QMainWindow):
         SIGNALS.file_done.connect(self._on_file_done)
         SIGNALS.file_done.connect(lambda: self._file_btn.setEnabled(True))
 
-        # Output stream opens once at startup — outputs silence when queue empty
-        try:
-            self._out_stream = sd.OutputStream(
-                samplerate=OUTPUT_RATE,
-                channels=1,
-                dtype="float32",
-                blocksize=_OUT_BLOCK,
-                callback=self._output_callback,
-            )
-            self._out_stream.start()
-        except Exception as e:
-            self._sb.showMessage(f"Warning: no audio output — {e}")
+        # Output stream — open on whichever device is selected in the combo
+        self._restart_output_stream(self._out_combo.currentData())
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
