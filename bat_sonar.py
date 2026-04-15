@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QFileDialog, QSlider, QDoubleSpinBox,
+    QGraphicsRectItem,
 )
 from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal, QObject
 from PyQt5.QtGui import QColor
@@ -248,6 +249,7 @@ class MainWindow(QMainWindow):
         self._is_playing    = False          # True while file playback is running
         self._playback_stop = threading.Event()  # set to abort playback
         self._last_detection_ts = ""        # timestamp of the most recent clip batch
+        self._clip_boxes: list = []         # annotation overlays on call detail panel
 
         # Clip accumulation (written only from audio callback thread)
         self._clip_active             = False
@@ -871,10 +873,14 @@ class MainWindow(QMainWindow):
 
     # ── Call detail spectrogram (Qt slot, GUI thread) ────────────────────────
     def _on_clip_spec(self, spec: np.ndarray, ts: str, annotations: list):
-        """Render the high-resolution spectrogram of the last saved clip.
-
-        spec : (n_frames, N_CLIP_BINS) float32 — log-magnitude
+        """Render the high-resolution spectrogram of the last saved clip,
+        with BatDetect2 bounding boxes and species labels overlaid.
         """
+        # Remove previous annotation overlays
+        for item in self._clip_boxes:
+            self._clip_plot.removeItem(item)
+        self._clip_boxes.clear()
+
         if spec.shape[0] < 2:
             return
 
@@ -888,8 +894,7 @@ class MainWindow(QMainWindow):
         ms_per_frame = (CLIP_HOP / SAMPLE_RATE) * 1000.0   # ≈ 0.333 ms per frame
         total_ms     = n_frames * ms_per_frame
 
-        # Start zoomed to ~500 ms so individual call shapes are clearly visible;
-        # user can click-drag left/right to scroll through the rest of the clip.
+        # Start zoomed to ~500 ms so individual call shapes are clearly visible
         view_frames = min(n_frames, int(500.0 / ms_per_frame))
         self._clip_plot.setXRange(0, view_frames, padding=0)
         self._clip_plot.setYRange(0, n_bins, padding=0)
@@ -906,6 +911,48 @@ class MainWindow(QMainWindow):
             x_ticks.append((t_ms / ms_per_frame, f"{t_ms:.0f}"))
             t_ms += 50.0
         self._clip_plot.getAxis("bottom").setTicks([x_ticks])
+
+        # ── BatDetect2 bounding boxes ──────────────────────────────────────────
+        freq_range = FREQ_MAX_HZ - FREQ_MIN_HZ
+        for ann in annotations:
+            prob = float(ann.get("class_prob", 0.0))
+            if prob < 0.2:          # skip very low confidence detections
+                continue
+
+            # Convert time (seconds) and frequency (Hz) to plot coordinates
+            x0 = ann.get("start_time", 0.0) * SAMPLE_RATE / CLIP_HOP
+            x1 = ann.get("end_time",   0.0) * SAMPLE_RATE / CLIP_HOP
+            y0 = (float(ann.get("low_freq",  FREQ_MIN_HZ)) - FREQ_MIN_HZ) / freq_range * N_CLIP_BINS
+            y1 = (float(ann.get("high_freq", FREQ_MAX_HZ)) - FREQ_MIN_HZ) / freq_range * N_CLIP_BINS
+
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            # Colour by confidence: green ≥ 70 %, amber ≥ 40 %, red below
+            if prob >= 0.7:
+                colour, rgb = "#4caf50", (76, 175, 80)
+            elif prob >= 0.4:
+                colour, rgb = "#ff9800", (255, 152, 0)
+            else:
+                colour, rgb = "#f44336", (244, 67, 54)
+
+            # Filled rectangle with semi-transparent interior
+            rect = QGraphicsRectItem(x0, y0, x1 - x0, y1 - y0)
+            rect.setPen(pg.mkPen(colour, width=1.5))
+            rect.setBrush(pg.mkBrush(*rgb, 45))   # 45/255 ≈ 18 % opacity
+            self._clip_plot.addItem(rect)
+            self._clip_boxes.append(rect)
+
+            # Species label just above the box
+            species = ann.get("class", "")
+            common  = _COMMON_NAMES.get(species, species)
+            label   = pg.TextItem(
+                f"{common}  {round(prob * 100)}%",
+                color=colour, anchor=(0, 1),
+            )
+            label.setPos(x0, y1)
+            self._clip_plot.addItem(label)
+            self._clip_boxes.append(label)
 
         self._clip_title.setText(f"<b>Call Detail</b> — {ts}")
 
