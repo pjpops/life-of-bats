@@ -326,7 +326,7 @@ class MainWindow(QMainWindow):
         self._sens_slider = QSlider(Qt.Horizontal)
         self._sens_slider.setFixedWidth(130)
         self._sens_slider.setRange(1, 10)
-        self._sens_slider.setValue(self._slider_from_thresh(RMS_THRESH))
+        self._sens_slider.setValue(5)
         self._sens_slider.setToolTip(
             "How easily a clip recording is triggered.\n"
             "Increase if bats are being missed; decrease if wind or\n"
@@ -349,8 +349,16 @@ class MainWindow(QMainWindow):
 
         self._filter_btn = QPushButton("Filter < 40% confidence")
         self._filter_btn.setCheckable(True)
+        self._filter_btn.setChecked(True)
         self._filter_btn.toggled.connect(self._toggle_low_conf_filter)
         row2.addWidget(self._filter_btn)
+
+        self._boxes_btn = QPushButton("Call boxes: on")
+        self._boxes_btn.setCheckable(True)
+        self._boxes_btn.setChecked(True)
+        self._boxes_btn.setToolTip("Show/hide BatDetect2 bounding boxes on the call detail panel")
+        self._boxes_btn.toggled.connect(self._toggle_boxes)
+        row2.addWidget(self._boxes_btn)
 
         row2.addStretch()
         vbox.addLayout(row2)
@@ -358,8 +366,9 @@ class MainWindow(QMainWindow):
         # ── Row 3: heterodyne audio output ────────────────────────────────────
         row3 = QHBoxLayout()
 
-        self._audio_btn = QPushButton("🔇  Audio off")
+        self._audio_btn = QPushButton("🔊  Audio on")
         self._audio_btn.setCheckable(True)
+        self._audio_btn.setChecked(True)
         self._audio_btn.setFixedWidth(110)
         self._audio_btn.setToolTip(
             "Frequency division audio (÷8).\n"
@@ -369,24 +378,11 @@ class MainWindow(QMainWindow):
         self._audio_btn.toggled.connect(self._toggle_audio)
         row3.addWidget(self._audio_btn)
 
-        row3.addSpacing(16)
-        row3.addWidget(QLabel("Volume:"))
-
-        self._vol_slider = QSlider(Qt.Horizontal)
-        self._vol_slider.setFixedWidth(100)
-        self._vol_slider.setRange(0, 100)
-        self._vol_slider.setValue(80)
-        self._vol_slider.valueChanged.connect(self._on_volume_changed)
-        row3.addWidget(self._vol_slider)
-
-        self._vol_label = QLabel("80%")
-        self._vol_label.setFixedWidth(36)
-        row3.addWidget(self._vol_label)
-
         row3.addSpacing(24)
 
-        self._notch_btn = QPushButton("Noise filter: off")
+        self._notch_btn = QPushButton("Noise filter: on")
         self._notch_btn.setCheckable(True)
+        self._notch_btn.setChecked(True)
         self._notch_btn.setFixedWidth(120)
         self._notch_btn.setToolTip(
             "Narrow notch filter that removes a fixed-frequency interference tone\n"
@@ -936,9 +932,9 @@ class MainWindow(QMainWindow):
             else:
                 text_colour = "#f44336"   # red
 
-            # Thin light grey box — subtle outline, no fill
+            # Thin dark grey box — subtle outline, no fill
             rect = QGraphicsRectItem(x0, y0, x1 - x0, y1 - y0)
-            rect.setPen(pg.mkPen((200, 200, 200), width=1))
+            rect.setPen(pg.mkPen((110, 110, 110), width=1))
             rect.setBrush(pg.mkBrush(0, 0, 0, 0))   # fully transparent fill
             self._clip_plot.addItem(rect)
             self._clip_boxes.append(rect)
@@ -953,6 +949,11 @@ class MainWindow(QMainWindow):
             label.setPos(x0, y1)
             self._clip_plot.addItem(label)
             self._clip_boxes.append(label)
+
+        # Respect the current boxes toggle state
+        show = self._boxes_btn.isChecked()
+        for item in self._clip_boxes:
+            item.setVisible(show)
 
         self._clip_title.setText(f"<b>Call Detail</b> — {ts}")
 
@@ -972,6 +973,11 @@ class MainWindow(QMainWindow):
         self._refs_visible = checked
         for line in self._ref_lines:
             line.setVisible(checked)
+
+    def _toggle_boxes(self, checked: bool):
+        self._boxes_btn.setText("Call boxes: on" if checked else "Call boxes: off")
+        for item in self._clip_boxes:
+            item.setVisible(checked)
 
     # ── Event filter — hide crosshairs when mouse leaves either plot ─────────
     def eventFilter(self, obj, event):
@@ -1194,10 +1200,6 @@ class MainWindow(QMainWindow):
     def _toggle_audio(self, checked: bool):
         self._audio_enabled[0] = checked
         self._audio_btn.setText("🔊  Audio on" if checked else "🔇  Audio off")
-
-    def _on_volume_changed(self, value: int):
-        self._volume[0] = value / 100.0
-        self._vol_label.setText(f"{value}%")
 
     # ── Notch filter ──────────────────────────────────────────────────────────
     @staticmethod
