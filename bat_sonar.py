@@ -349,15 +349,15 @@ class MainWindow(QMainWindow):
 
         self._filter_btn = QPushButton("Filter < 40% confidence")
         self._filter_btn.setCheckable(True)
-        self._filter_btn.setChecked(True)
         self._filter_btn.toggled.connect(self._toggle_low_conf_filter)
+        self._filter_btn.setChecked(True)
         row2.addWidget(self._filter_btn)
 
         self._boxes_btn = QPushButton("Call boxes: on")
         self._boxes_btn.setCheckable(True)
-        self._boxes_btn.setChecked(True)
         self._boxes_btn.setToolTip("Show/hide BatDetect2 bounding boxes on the call detail panel")
         self._boxes_btn.toggled.connect(self._toggle_boxes)
+        self._boxes_btn.setChecked(True)
         row2.addWidget(self._boxes_btn)
 
         row2.addStretch()
@@ -368,7 +368,6 @@ class MainWindow(QMainWindow):
 
         self._audio_btn = QPushButton("🔊  Audio on")
         self._audio_btn.setCheckable(True)
-        self._audio_btn.setChecked(True)
         self._audio_btn.setFixedWidth(110)
         self._audio_btn.setToolTip(
             "Frequency division audio (÷8).\n"
@@ -376,13 +375,13 @@ class MainWindow(QMainWindow):
             "45 kHz → 5.6 kHz, 110 kHz → 13.75 kHz, etc."
         )
         self._audio_btn.toggled.connect(self._toggle_audio)
+        self._audio_btn.setChecked(True)
         row3.addWidget(self._audio_btn)
 
         row3.addSpacing(24)
 
         self._notch_btn = QPushButton("Noise filter: on")
         self._notch_btn.setCheckable(True)
-        self._notch_btn.setChecked(True)
         self._notch_btn.setFixedWidth(120)
         self._notch_btn.setToolTip(
             "Narrow notch filter that removes a fixed-frequency interference tone\n"
@@ -390,6 +389,7 @@ class MainWindow(QMainWindow):
             "Affects both the waterfall display and the audio output."
         )
         self._notch_btn.toggled.connect(self._toggle_notch)
+        self._notch_btn.setChecked(True)
         row3.addWidget(self._notch_btn)
 
         self._notch_spin = QDoubleSpinBox()
