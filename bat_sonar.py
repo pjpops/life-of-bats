@@ -928,27 +928,27 @@ class MainWindow(QMainWindow):
             if x1 <= x0 or y1 <= y0:
                 continue
 
-            # Colour by confidence: green ≥ 70 %, amber ≥ 40 %, red below
+            # Colour coding for text labels
             if prob >= 0.7:
-                colour, rgb = "#4caf50", (76, 175, 80)
+                text_colour = "#4caf50"   # green
             elif prob >= 0.4:
-                colour, rgb = "#ff9800", (255, 152, 0)
+                text_colour = "#ff9800"   # amber
             else:
-                colour, rgb = "#f44336", (244, 67, 54)
+                text_colour = "#f44336"   # red
 
-            # Filled rectangle with semi-transparent interior
+            # Thin light grey box — subtle outline, no fill
             rect = QGraphicsRectItem(x0, y0, x1 - x0, y1 - y0)
-            rect.setPen(pg.mkPen(colour, width=1.5))
-            rect.setBrush(pg.mkBrush(*rgb, 45))   # 45/255 ≈ 18 % opacity
+            rect.setPen(pg.mkPen((200, 200, 200), width=1))
+            rect.setBrush(pg.mkBrush(0, 0, 0, 0))   # fully transparent fill
             self._clip_plot.addItem(rect)
             self._clip_boxes.append(rect)
 
-            # Species label just above the box
+            # Species label just above the box, colour-coded by confidence
             species = ann.get("class", "")
             common  = _COMMON_NAMES.get(species, species)
             label   = pg.TextItem(
                 f"{common}  {round(prob * 100)}%",
-                color=colour, anchor=(0, 1),
+                color=text_colour, anchor=(0, 1),
             )
             label.setPos(x0, y1)
             self._clip_plot.addItem(label)
