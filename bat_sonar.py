@@ -993,6 +993,9 @@ class MainWindow(QMainWindow):
     # ── Low-confidence filter toggle ──────────────────────────────────────────
     def _toggle_low_conf_filter(self, checked: bool):
         self._hide_low_conf = checked
+        # Table may not exist yet if called during UI construction
+        if not hasattr(self, '_table'):
+            return
         # Show/hide existing rows whose confidence is below 0.40
         for row in range(self._table.rowCount()):
             conf_item = self._table.item(row, 2)
