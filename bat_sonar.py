@@ -46,7 +46,7 @@ WATERFALL_COLS  = 600            # ~12 s of history
 CLIP_SECS       = 3              # seconds recorded per trigger
 CLIP_SAMPLES    = SAMPLE_RATE * CLIP_SECS
 DEBOUNCE_SECS   = 2.0            # minimum gap between triggers
-RMS_THRESH      = 0.005          # minimum RMS to check for ultrasonics
+RMS_THRESH      = 0.0173         # minimum RMS to check for ultrasonics (level 7 default)
 ULTRA_RATIO     = 0.05           # fraction of energy that must be above ULTRA_MIN_HZ
 ULTRA_MIN_HZ    = 20_000         # ultrasonic threshold
 
@@ -251,6 +251,11 @@ class MainWindow(QMainWindow):
         self._last_detection_ts = ""        # timestamp of the most recent clip batch
         self._clip_boxes: list = []         # annotation overlays on call detail panel
 
+        # Clip cache and pin state for the Recent Detections → Call Detail link
+        # Stores the last 50 clips as {ts: (spec, annotations)} in insertion order
+        self._clip_cache: dict = {}
+        self._pinned_ts: str | None = None   # None = live (always shows latest)
+
         # Clip accumulation (written only from audio callback thread)
         self._clip_active             = False
         self._clip_buf: list          = []
@@ -326,7 +331,8 @@ class MainWindow(QMainWindow):
         self._sens_slider = QSlider(Qt.Horizontal)
         self._sens_slider.setFixedWidth(130)
         self._sens_slider.setRange(1, 10)
-        self._sens_slider.setValue(5)
+        _default_level = self._slider_from_thresh(RMS_THRESH)
+        self._sens_slider.setValue(_default_level)
         self._sens_slider.setToolTip(
             "How easily a clip recording is triggered.\n"
             "Increase if bats are being missed; decrease if wind or\n"
@@ -336,9 +342,11 @@ class MainWindow(QMainWindow):
         row2.addWidget(self._sens_slider)
         row2.addWidget(QLabel("High"))
 
-        self._sens_label = QLabel(f"Level {self._sens_slider.value()}/10")
+        self._sens_label = QLabel(f"Level {_default_level}/10")
         self._sens_label.setFixedWidth(68)
         row2.addWidget(self._sens_label)
+        # Sync the runtime threshold to the slider's starting value
+        self._rms_thresh = round(0.050 - (_default_level - 1) / 9 * 0.049, 4)
 
         row2.addSpacing(16)
 
@@ -396,7 +404,7 @@ class MainWindow(QMainWindow):
         self._notch_spin.setRange(FREQ_MIN_HZ / 1000, FREQ_MAX_HZ / 1000)
         self._notch_spin.setValue(self._notch_freq_hz / 1000)
         self._notch_spin.setSuffix(" kHz")
-        self._notch_spin.setSingleStep(0.5)
+        self._notch_spin.setSingleStep(0.1)
         self._notch_spin.setDecimals(1)
         self._notch_spin.setFixedWidth(90)
         self._notch_spin.setToolTip("Centre frequency of the noise notch filter")
@@ -596,8 +604,10 @@ class MainWindow(QMainWindow):
         self._table.horizontalHeader().setDefaultSectionSize(120)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
-        self._table.setSelectionMode(QTableWidget.NoSelection)
+        self._table.setSelectionMode(QTableWidget.SingleSelection)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.verticalHeader().setVisible(False)
+        self._table.itemClicked.connect(self._on_table_click)
         det_vbox.addWidget(self._table)
 
         splitter.addWidget(det_widget)
@@ -869,7 +879,23 @@ class MainWindow(QMainWindow):
 
     # ── Call detail spectrogram (Qt slot, GUI thread) ────────────────────────
     def _on_clip_spec(self, spec: np.ndarray, ts: str, annotations: list):
-        """Render the high-resolution spectrogram of the last saved clip,
+        """Cache the clip and render it — unless the view is pinned to a
+        different recording, in which case just cache and return.
+        """
+        # Cache for later replay (keyed by timestamp, most-recent-last)
+        self._clip_cache[ts] = (spec, annotations)
+        # Trim to last 50 clips to bound memory use
+        while len(self._clip_cache) > 50:
+            self._clip_cache.pop(next(iter(self._clip_cache)))
+
+        # Don't overwrite the pinned view with a new live clip
+        if self._pinned_ts is not None and self._pinned_ts != ts:
+            return
+
+        self._render_clip(spec, ts, annotations)
+
+    def _render_clip(self, spec: np.ndarray, ts: str, annotations: list):
+        """Render the high-resolution spectrogram of a clip,
         with BatDetect2 bounding boxes and species labels overlaid.
         """
         # Remove previous annotation overlays
@@ -955,7 +981,53 @@ class MainWindow(QMainWindow):
         for item in self._clip_boxes:
             item.setVisible(show)
 
-        self._clip_title.setText(f"<b>Call Detail</b> — {ts}")
+        # Title shows pin state
+        if self._pinned_ts == ts:
+            self._clip_title.setText(
+                f"<b>Call Detail</b> — {ts} &nbsp;📌&nbsp;"
+                f"<small style='color:#888'>pinned — click row again to unpin</small>"
+            )
+        else:
+            self._clip_title.setText(f"<b>Call Detail</b> — {ts}")
+
+    # ── Table row click — pin / unpin a recording ─────────────────────────────
+    def _get_row_ts(self, row: int) -> str | None:
+        """Extract the HH:MM:SS timestamp from any row (separator or species)."""
+        item = self._table.item(row, 0)
+        if item is None:
+            return None
+        text = item.text().strip()
+        # Separator rows look like "── 14:23:45 ──"
+        if text.startswith("─"):
+            text = text.strip("─ ")
+        return text if text else None
+
+    def _on_table_click(self, item: QTableWidgetItem):
+        ts = self._get_row_ts(item.row())
+        if ts is None:
+            self._table.clearSelection()
+            return
+
+        if self._pinned_ts == ts:
+            # ── Unpin: return to live view ──────────────────────────────────
+            self._pinned_ts = None
+            self._table.clearSelection()
+            # Re-render the most recent cached clip (so the panel isn't blank)
+            if self._clip_cache:
+                latest_ts = list(self._clip_cache.keys())[-1]
+                spec, anns = self._clip_cache[latest_ts]
+                self._render_clip(spec, latest_ts, anns)
+            else:
+                self._clip_title.setText("<b>Call Detail</b> — live (no clip yet)")
+        else:
+            # ── Pin to this recording ───────────────────────────────────────
+            if ts not in self._clip_cache:
+                # Recording not in memory (older than 50 clips) — ignore
+                self._table.clearSelection()
+                return
+            self._pinned_ts = ts
+            spec, anns = self._clip_cache[ts]
+            self._render_clip(spec, ts, anns)
 
     # ── Sensitivity slider ────────────────────────────────────────────────────
     @staticmethod
@@ -993,6 +1065,9 @@ class MainWindow(QMainWindow):
     # ── Low-confidence filter toggle ──────────────────────────────────────────
     def _toggle_low_conf_filter(self, checked: bool):
         self._hide_low_conf = checked
+        # Table may not exist yet if called during UI construction
+        if not hasattr(self, '_table'):
+            return
         # Show/hide existing rows whose confidence is below 0.40
         for row in range(self._table.rowCount()):
             conf_item = self._table.item(row, 2)
