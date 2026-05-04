@@ -1687,11 +1687,16 @@ class MainWindow(QMainWindow):
     # ── BSG-BAT helpers ────────────────────────────────────────────────────────
     @staticmethod
     def _parse_bsg(results: dict):
-        """Return (hits, bg_prob).  hits = [(species_key, prob)] sorted desc, ≥35%."""
+        """Return (hits, bg_prob).  hits = [(species_key, prob)] sorted desc, ≥20%.
+
+        The threshold is deliberately low so that secondary species (e.g. Serotine
+        at 25% alongside Common Pip at 99%) still appear — colour-coding conveys
+        confidence, hiding them entirely causes more confusion than showing them dimly.
+        """
         bg_prob = results.get("Background", 0.0)
         hits = [
             (sp, p) for sp, p in results.items()
-            if sp != "Background" and p >= 0.35
+            if sp != "Background" and p >= 0.20
         ]
         hits.sort(key=lambda x: -x[1])
         return hits, bg_prob
@@ -1799,7 +1804,8 @@ class MainWindow(QMainWindow):
                 f"{_BSG_NAMES.get(sp, sp)} {round(p * 100)}%"
                 for sp, p in hits[:2]
             )
-            colour = "#4caf50" if hits[0][1] >= 0.70 else "#ff9800"
+            top_p  = hits[0][1]
+            colour = "#4caf50" if top_p >= 0.70 else ("#ff9800" if top_p >= 0.40 else "#888888")
 
         col0    = self._table.item(row, 0)
         wav_key = col0.data(Qt.UserRole) if col0 else wav_path_str
