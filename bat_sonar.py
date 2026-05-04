@@ -9,6 +9,8 @@ detected and automatically identified by BatDetect2.
 
 import sys
 import os
+import re
+import json as _json
 import queue
 import threading
 import time
@@ -20,6 +22,9 @@ import sounddevice as sd
 import soundfile as sf
 from scipy.signal import resample_poly, butter, sosfilt, sosfilt_zi, iirnotch
 from math import gcd
+
+# ── BSG-BAT ───────────────────────────────────────────────────────────────────
+from bsg_bat import BSG, COMMON_NAMES as _BSG_NAMES
 
 # ── BatDetect2 path ────────────────────────────────────────────────────────────
 _BD2_PATH = str(Path(__file__).resolve().parent.parent / "bat_detector")
@@ -51,10 +56,16 @@ ULTRA_RATIO     = 0.05           # fraction of energy that must be above ULTRA_M
 ULTRA_MIN_HZ    = 20_000         # ultrasonic threshold
 
 RECORDINGS_DIR  = Path(__file__).resolve().parent / "recordings"
+BAT_DATA_DIR    = Path.home() / "Desktop" / "Bat data"
+
+# Survey browser — species considered "not interesting" (same logic as cleanup_wavs.py)
+_SURVEY_COMMON  = frozenset({"Pipistrellus pipistrellus", "Pipistrellus pygmaeus"})
+_SURVEY_THRESH  = 0.3
 
 # Latin → English common names for UK bat species returned by BatDetect2
 _COMMON_NAMES: dict[str, str] = {
     "Barbastella barbastellus":    "Barbastelle",
+    "Barbastellus barbastellus":   "Barbastelle",
     "Eptesicus serotinus":         "Serotine",
     "Myotis alcathoe":             "Alcathoe's Bat",
     "Myotis bechsteinii":          "Bechstein's Bat",
@@ -127,10 +138,11 @@ _HP_SOS = butter(6, 15_000 / (SAMPLE_RATE / 2), btype="high", output="sos")
 
 # ── Cross-thread Qt signals ────────────────────────────────────────────────────
 class _Signals(QObject):
-    detection = pyqtSignal(str, str, float)   # timestamp, species, confidence
-    status    = pyqtSignal(str)               # status bar message
-    file_done = pyqtSignal()                  # file load finished → re-enable button
-    clip_spec = pyqtSignal(object, str, object)  # spec array, timestamp, annotations
+    detection  = pyqtSignal(str, str, float)    # timestamp, species, confidence
+    status     = pyqtSignal(str)                # status bar message
+    file_done  = pyqtSignal()                   # file load finished → re-enable button
+    clip_spec  = pyqtSignal(object, str, object)  # spec array, timestamp, annotations
+    bsg_result = pyqtSignal(str, object)        # timestamp, {species: prob}
 
 SIGNALS = _Signals()
 
@@ -199,6 +211,12 @@ def _save_and_analyse_worker():
             spec = _compute_clip_spec(audio)
             SIGNALS.clip_spec.emit(spec, sig_ts, annotations)
 
+            # BSG-BAT second opinion (runs after BatDetect2, non-blocking on failure)
+            if BSG.available:
+                bsg = BSG.classify(wav_path)
+                if bsg:
+                    SIGNALS.bsg_result.emit(sig_ts, bsg)
+
             if best:
                 for sp, conf in sorted(best.items(), key=lambda x: -x[1]):
                     SIGNALS.detection.emit(sig_ts, sp, conf)
@@ -234,6 +252,9 @@ class MainWindow(QMainWindow):
         self._rms_thresh = RMS_THRESH   # adjustable at runtime via slider
         self._refs_visible = False
         self._prev_clip_active = False  # for recording-dot state tracking
+        self._hide_common  = True        # hide common/soprano pip boxes by default
+        self._brightness   = 1.0        # call detail brightness multiplier
+        self._bright_step  = 0          # integer offset from default (0 = spec.max())
 
         # Heterodyne audio output — single-element lists so the worker thread
         # can read updated values without explicit locks
@@ -255,6 +276,9 @@ class MainWindow(QMainWindow):
         # Stores the last 50 clips as {ts: (spec, annotations)} in insertion order
         self._clip_cache: dict = {}
         self._pinned_ts: str | None = None   # None = live (always shows latest)
+
+        # Survey browser state
+        self._survey_mode = False
 
         # Clip accumulation (written only from audio callback thread)
         self._clip_active             = False
@@ -321,7 +345,26 @@ class MainWindow(QMainWindow):
         self._file_btn.clicked.connect(self._open_file)
         row1.addWidget(self._file_btn)
 
+        self._survey_btn = QPushButton("🦇  Browse Survey")
+        self._survey_btn.setToolTip("Open a dated survey folder and browse interesting recordings")
+        self._survey_btn.clicked.connect(self._browse_survey)
+        row1.addWidget(self._survey_btn)
+
+        self._live_btn = QPushButton("↩  Live")
+        self._live_btn.setToolTip("Return to live monitoring mode")
+        self._live_btn.setVisible(False)
+        self._live_btn.clicked.connect(self._exit_survey)
+        row1.addWidget(self._live_btn)
+
         vbox.addLayout(row1)
+
+        # Survey mode banner — hidden until a survey folder is loaded
+        self._survey_banner = QLabel("")
+        self._survey_banner.setStyleSheet(
+            "color: #4caf50; padding: 2px 4px; font-weight: bold;"
+        )
+        self._survey_banner.setVisible(False)
+        vbox.addWidget(self._survey_banner)
 
         # ── Row 2: sensitivity + species refs + filter ────────────────────────
         row2 = QHBoxLayout()
@@ -354,19 +397,6 @@ class MainWindow(QMainWindow):
         self._refs_btn.setCheckable(True)
         self._refs_btn.toggled.connect(self._toggle_refs)
         row2.addWidget(self._refs_btn)
-
-        self._filter_btn = QPushButton("Filter < 40% confidence")
-        self._filter_btn.setCheckable(True)
-        self._filter_btn.toggled.connect(self._toggle_low_conf_filter)
-        self._filter_btn.setChecked(True)
-        row2.addWidget(self._filter_btn)
-
-        self._boxes_btn = QPushButton("Call boxes: on")
-        self._boxes_btn.setCheckable(True)
-        self._boxes_btn.setToolTip("Show/hide BatDetect2 bounding boxes on the call detail panel")
-        self._boxes_btn.toggled.connect(self._toggle_boxes)
-        self._boxes_btn.setChecked(True)
-        row2.addWidget(self._boxes_btn)
 
         row2.addStretch()
         vbox.addLayout(row2)
@@ -539,8 +569,65 @@ class MainWindow(QMainWindow):
         clip_vbox.setContentsMargins(0, 4, 0, 0)
         clip_vbox.setSpacing(2)
 
+        clip_header = QHBoxLayout()
+        clip_header.setSpacing(4)
+
         self._clip_title = QLabel("<b>Call Detail</b> — no clip yet")
-        clip_vbox.addWidget(self._clip_title)
+        clip_header.addWidget(self._clip_title)
+        clip_header.addStretch()
+
+        # ── Common pips filter ────────────────────────────────────────────────
+        self._common_btn = QPushButton("Common pips: hidden")
+        self._common_btn.setCheckable(True)
+        self._common_btn.setChecked(True)
+        self._common_btn.setToolTip(
+            "Hide bounding boxes and labels for Common and Soprano Pipistrelle."
+        )
+        self._common_btn.toggled.connect(self._toggle_hide_common)
+        clip_header.addWidget(self._common_btn)
+
+        # ── Call boxes toggle ─────────────────────────────────────────────────
+        self._boxes_btn = QPushButton("Call boxes: on")
+        self._boxes_btn.setCheckable(True)
+        self._boxes_btn.setChecked(True)
+        self._boxes_btn.setToolTip("Show/hide BatDetect2 bounding boxes on the call detail panel")
+        self._boxes_btn.toggled.connect(self._toggle_boxes)
+        clip_header.addWidget(self._boxes_btn)
+
+        clip_header.addSpacing(8)
+
+        # ── Brightness +/− controls ───────────────────────────────────────────
+        clip_header.addWidget(QLabel("Brightness:"))
+
+        bright_minus = QPushButton("−")
+        bright_minus.setFixedWidth(26)
+        bright_minus.setToolTip("Decrease brightness (dimmer)")
+        bright_minus.clicked.connect(self._brightness_down)
+        clip_header.addWidget(bright_minus)
+
+        self._bright_label = QLabel("0")
+        self._bright_label.setFixedWidth(28)
+        self._bright_label.setAlignment(Qt.AlignCenter)
+        self._bright_label.setToolTip("0 = natural (spec.max()), + = brighter, − = dimmer")
+        clip_header.addWidget(self._bright_label)
+
+        bright_plus = QPushButton("+")
+        bright_plus.setFixedWidth(26)
+        bright_plus.setToolTip("Increase brightness (brighter)")
+        bright_plus.clicked.connect(self._brightness_up)
+        clip_header.addWidget(bright_plus)
+
+        bright_reset = QPushButton("↺")
+        bright_reset.setFixedWidth(26)
+        bright_reset.setToolTip("Reset brightness to default")
+        bright_reset.clicked.connect(self._brightness_reset)
+        clip_header.addWidget(bright_reset)
+
+        clip_vbox.addLayout(clip_header)
+
+        self._bsg_label = QLabel("BSG-BAT: loading models…")
+        self._bsg_label.setStyleSheet("color: #666666; font-size: 11px; padding: 0 2px;")
+        clip_vbox.addWidget(self._bsg_label)
 
         self._clip_plot = pg.PlotWidget(background="k")
         self._clip_plot.setLabel("left",   "Frequency (kHz)")
@@ -596,7 +683,17 @@ class MainWindow(QMainWindow):
         det_widget = QWidget()
         det_vbox   = QVBoxLayout(det_widget)
         det_vbox.setContentsMargins(0, 4, 0, 0)
-        det_vbox.addWidget(QLabel("<b>Recent Detections</b>"))
+
+        det_header = QHBoxLayout()
+        det_header.addWidget(QLabel("<b>Recent Detections</b>"))
+        det_header.addStretch()
+        self._filter_btn = QPushButton("Filter < 40%")
+        self._filter_btn.setCheckable(True)
+        self._filter_btn.setChecked(True)
+        self._filter_btn.setToolTip("Hide detections below 40% confidence")
+        self._filter_btn.toggled.connect(self._toggle_low_conf_filter)
+        det_header.addWidget(self._filter_btn)
+        det_vbox.addLayout(det_header)
 
         self._table = QTableWidget(0, 3)
         self._table.setHorizontalHeaderLabels(["Time", "Species", "Confidence"])
@@ -906,10 +1003,11 @@ class MainWindow(QMainWindow):
         if spec.shape[0] < 2:
             return
 
-        # Display image — spec is (time, freq), col-major so x=time, y=freq
-        clip_max = float(spec.max())
+        # spec.max() as natural baseline; brightness multiplier shifts it
+        # (< 1.0 = brighter, > 1.0 = dimmer — set via slider)
+        clip_ceil = float(spec.max()) * self._brightness
         self._clip_img.setImage(spec, autoLevels=False,
-                                levels=(0.0, max(clip_max, 0.1)))
+                                levels=(0.0, max(clip_ceil, 0.01)))
 
         # Fit the view to the image extent
         n_frames, n_bins = spec.shape
@@ -940,6 +1038,8 @@ class MainWindow(QMainWindow):
             prob = float(ann.get("class_prob", 0.0))
             if prob < 0.2:          # skip very low confidence detections
                 continue
+            if self._hide_common and ann.get("class") in _SURVEY_COMMON:
+                continue            # suppress common/soprano pip boxes
 
             # Convert time (seconds) and frequency (Hz) to plot coordinates
             x0 = ann.get("start_time", 0.0) * SAMPLE_RATE / CLIP_HOP
@@ -1003,16 +1103,25 @@ class MainWindow(QMainWindow):
         return text if text else None
 
     def _on_table_click(self, item: QTableWidgetItem):
+        # ── Survey mode: load the WAV the row refers to ───────────────────────
+        if self._survey_mode:
+            wav_str = item.data(Qt.UserRole)
+            if not wav_str:
+                self._table.clearSelection()
+                return
+            self._load_survey_wav(Path(wav_str))
+            return
+
+        # ── Live mode: pin / unpin ────────────────────────────────────────────
         ts = self._get_row_ts(item.row())
         if ts is None:
             self._table.clearSelection()
             return
 
         if self._pinned_ts == ts:
-            # ── Unpin: return to live view ──────────────────────────────────
+            # Unpin: return to live view
             self._pinned_ts = None
             self._table.clearSelection()
-            # Re-render the most recent cached clip (so the panel isn't blank)
             if self._clip_cache:
                 latest_ts = list(self._clip_cache.keys())[-1]
                 spec, anns = self._clip_cache[latest_ts]
@@ -1020,14 +1129,196 @@ class MainWindow(QMainWindow):
             else:
                 self._clip_title.setText("<b>Call Detail</b> — live (no clip yet)")
         else:
-            # ── Pin to this recording ───────────────────────────────────────
+            # Pin to this recording
             if ts not in self._clip_cache:
-                # Recording not in memory (older than 50 clips) — ignore
                 self._table.clearSelection()
                 return
             self._pinned_ts = ts
             spec, anns = self._clip_cache[ts]
             self._render_clip(spec, ts, anns)
+
+    # ── Survey browser ────────────────────────────────────────────────────────
+    def _browse_survey(self):
+        """Open a folder picker and load interesting recordings from that survey night."""
+        start = str(BAT_DATA_DIR) if BAT_DATA_DIR.exists() else str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select survey folder", start)
+        if folder:
+            self._load_survey_folder(Path(folder))
+
+    def _load_survey_folder(self, folder: Path):
+        """Scan a survey folder, populate the table with recordings that have
+        interesting (non-common-pip) detections and a WAV file still present.
+        """
+        det_dir = folder / "detections"
+        if not det_dir.exists():
+            self._sb.showMessage(f"No detections folder in {folder.name} — run BatDetect2 first.")
+            return
+
+        entries = []   # (ts_display, wav_path, all_annotations, interesting_annotations)
+        for wav in sorted(
+            w for w in folder.iterdir()
+            if w.suffix.lower() == ".wav" and not w.name.startswith("._")
+        ):
+            json_path = det_dir / (wav.name + ".json")
+            if not json_path.exists():
+                continue   # not yet processed
+            try:
+                data = _json.loads(json_path.read_text())
+            except Exception:
+                continue
+            all_anns = data.get("annotation", [])
+            interesting = [
+                a for a in all_anns
+                if float(a.get("class_prob", 0)) >= _SURVEY_THRESH
+                and a.get("class") not in _SURVEY_COMMON
+            ]
+            if not interesting:
+                continue   # only common/soprano pips — skip
+            m = re.search(r"(\d{8})_(\d{6})", wav.name)
+            t = m.group(2) if m else "000000"
+            ts = f"{t[:2]}:{t[2:4]}:{t[4:]}"
+            entries.append((ts, wav, all_anns, interesting))
+
+        if not entries:
+            self._sb.showMessage(
+                f"No interesting calls found in {folder.name} "
+                f"(all WAVs are common/soprano pip only, or none processed yet)."
+            )
+            return
+
+        # Enter survey mode
+        self._survey_mode = True
+        self._pinned_ts   = None
+        self._clip_cache.clear()
+
+        # Switch to 4-column layout for survey mode
+        self._table.setRowCount(0)
+        self._table.setColumnCount(4)
+        self._table.setHorizontalHeaderLabels(["Time", "File", "Species detected", "Best conf."])
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(3, QHeaderView.Fixed)
+        self._table.setColumnWidth(0, 72)
+        self._table.setColumnWidth(1, 200)
+        self._table.setColumnWidth(3, 80)
+
+        for ts, wav, all_anns, interesting_anns in entries:
+            # Deduplicate: keep best confidence per species across all detections
+            best: dict[str, float] = {}
+            for ann in interesting_anns:
+                sp   = ann.get("class", "")
+                prob = float(ann.get("class_prob", 0))
+                if prob > best.get(sp, 0.0):
+                    best[sp] = prob
+
+            # Build display strings — sorted by confidence descending
+            ranked   = sorted(best.items(), key=lambda x: -x[1])
+            sp_names = "  ·  ".join(_COMMON_NAMES.get(sp, sp) for sp, _ in ranked)
+            sp_tips  = "\n".join(f"{_COMMON_NAMES.get(sp,sp)}: {round(p*100)}%" for sp, p in ranked)
+            top_conf = ranked[0][1] if ranked else 0.0
+
+            r = self._table.rowCount()
+            self._table.insertRow(r)
+
+            ts_item = QTableWidgetItem(ts)
+            ts_item.setData(Qt.UserRole, str(wav))
+            self._table.setItem(r, 0, ts_item)
+
+            file_item = QTableWidgetItem(wav.stem)   # filename without .wav
+            file_item.setToolTip(wav.name)
+            file_item.setData(Qt.UserRole, str(wav))
+            file_item.setForeground(QColor("#888888"))
+            self._table.setItem(r, 1, file_item)
+
+            sp_item = QTableWidgetItem(sp_names)
+            sp_item.setToolTip(sp_tips)
+            sp_item.setData(Qt.UserRole, str(wav))
+            if top_conf >= 0.7:
+                sp_item.setForeground(QColor("#4caf50"))
+            elif top_conf >= 0.4:
+                sp_item.setForeground(QColor("#ff9800"))
+            self._table.setItem(r, 2, sp_item)
+
+            conf_item = QTableWidgetItem(f"{round(top_conf * 100)}%")
+            conf_item.setData(Qt.UserRole, str(wav))
+            self._table.setItem(r, 3, conf_item)
+
+        n = len(entries)
+        self._survey_banner.setText(
+            f"🦇  Survey: {folder.name}  ·  "
+            f"{n} interesting recording{'s' if n != 1 else ''}  —  click any row to view"
+        )
+        self._survey_banner.setVisible(True)
+        self._live_btn.setVisible(True)
+        self._survey_btn.setVisible(False)
+        self._clip_title.setText("<b>Call Detail</b> — click a row to view")
+        self._sb.showMessage(f"Survey loaded: {n} interesting recordings in {folder.name}")
+
+    def _load_survey_wav(self, wav_path: Path):
+        """Load a WAV file and its existing JSON annotations into the Call Detail
+        panel without re-running BatDetect2 — the JSON already has the results.
+        """
+        self._sb.showMessage(f"Loading {wav_path.name} …")
+
+        def _work():
+            try:
+                audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+                if audio.ndim > 1:
+                    audio = audio[:, 0]
+                if sr != SAMPLE_RATE:
+                    g     = gcd(SAMPLE_RATE, sr)
+                    audio = resample_poly(
+                        audio, SAMPLE_RATE // g, sr // g
+                    ).astype(np.float32)
+
+                spec = _compute_clip_spec(audio)
+
+                json_path = wav_path.parent / "detections" / (wav_path.name + ".json")
+                annotations = []
+                if json_path.exists():
+                    data        = _json.loads(json_path.read_text())
+                    annotations = data.get("annotation", [])
+
+                m  = re.search(r"(\d{8})_(\d{6})", wav_path.name)
+                t  = m.group(2) if m else "000000"
+                ts = f"{t[:2]}:{t[2:4]}:{t[4:]}"
+
+                SIGNALS.clip_spec.emit(spec, ts, annotations)
+                SIGNALS.status.emit(f"Loaded {wav_path.name}")
+
+                # BSG-BAT second opinion (non-blocking; skipped if models not ready)
+                if BSG.available:
+                    bsg = BSG.classify(str(wav_path))
+                    if bsg:
+                        SIGNALS.bsg_result.emit(ts, bsg)
+
+            except Exception as e:
+                SIGNALS.status.emit(f"Error loading {wav_path.name}: {e}")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _exit_survey(self):
+        """Leave survey mode and return to live monitoring."""
+        self._survey_mode = False
+        self._pinned_ts   = None
+        self._clip_cache.clear()
+        self._table.setRowCount(0)
+        self._last_detection_ts = ""
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["Time", "Species", "Confidence"])
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Interactive)
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.Interactive)
+        self._table.setColumnWidth(0, 120)
+        self._table.setColumnWidth(2, 120)
+        self._survey_banner.setVisible(False)
+        self._live_btn.setVisible(False)
+        self._survey_btn.setVisible(True)
+        self._clip_title.setText("<b>Call Detail</b> — no clip yet")
+        self._sb.showMessage("Returned to live mode.")
 
     # ── Sensitivity slider ────────────────────────────────────────────────────
     @staticmethod
@@ -1045,6 +1336,50 @@ class MainWindow(QMainWindow):
         self._refs_visible = checked
         for line in self._ref_lines:
             line.setVisible(checked)
+
+    def _apply_brightness(self):
+        """Recompute the brightness multiplier from _bright_step and update the
+        image levels without touching the pan/zoom state."""
+        # Log scale: each step ≈ ×1.33 brighter or dimmer
+        # step  0 → 1.0  (spec.max(), original look)
+        # step +9 → 0.13 (very bright)
+        # step −9 → 7.9  (very dim)
+        self._brightness = 10.0 ** (-self._bright_step / 9.0)
+        sign = "+" if self._bright_step > 0 else ""
+        self._bright_label.setText(f"{sign}{self._bright_step}")
+        if self._clip_cache:
+            ts = self._pinned_ts or list(self._clip_cache.keys())[-1]
+            if ts in self._clip_cache:
+                spec, _ = self._clip_cache[ts]
+                clip_ceil = float(spec.max()) * self._brightness
+                self._clip_img.setImage(spec, autoLevels=False,
+                                        levels=(0.0, max(clip_ceil, 0.01)))
+
+    def _brightness_up(self):
+        if self._bright_step < 9:
+            self._bright_step += 1
+            self._apply_brightness()
+
+    def _brightness_down(self):
+        if self._bright_step > -9:
+            self._bright_step -= 1
+            self._apply_brightness()
+
+    def _brightness_reset(self):
+        self._bright_step = 0
+        self._apply_brightness()
+
+    def _toggle_hide_common(self, checked: bool):
+        self._hide_common = checked
+        self._common_btn.setText(
+            "Common pips: hidden" if checked else "Common pips: visible"
+        )
+        # Re-render the current clip so the change takes effect immediately
+        if self._clip_cache:
+            ts = self._pinned_ts or list(self._clip_cache.keys())[-1]
+            if ts in self._clip_cache:
+                spec, anns = self._clip_cache[ts]
+                self._render_clip(spec, ts, anns)
 
     def _toggle_boxes(self, checked: bool):
         self._boxes_btn.setText("Call boxes: on" if checked else "Call boxes: off")
@@ -1311,6 +1646,64 @@ class MainWindow(QMainWindow):
         except queue.Empty:
             outdata[:, 0] = 0.0
 
+    # ── BSG-BAT result handler (Qt slot, GUI thread) ─────────────────────────
+    def _on_bsg_result(self, ts: str, results: dict):
+        """Display BSG-BAT species ID results in the clip panel label.
+
+        Only shown if the result belongs to the currently displayed clip
+        (live latest, or pinned).  Results from background clips are cached
+        but quietly ignored so the label always matches the visible call.
+        """
+        # Sentinel emitted when models finish loading
+        if ts == "__ready__":
+            if not self._clip_cache:
+                self._bsg_label.setText("BSG-BAT: ready — waiting for first clip")
+                self._bsg_label.setStyleSheet(
+                    "color: #4caf50; font-size: 11px; padding: 0 2px;"
+                )
+            return
+
+        # Only update if this result is for the clip currently on screen
+        current_ts = self._pinned_ts or (
+            list(self._clip_cache.keys())[-1] if self._clip_cache else None
+        )
+        if ts != current_ts:
+            return
+
+        bg_prob = results.get("Background", 0.0)
+        hits = [
+            (sp, p)
+            for sp, p in results.items()
+            if sp != "Background" and p >= 0.35
+        ]
+        hits.sort(key=lambda x: -x[1])
+
+        if not hits:
+            if bg_prob >= 0.70:
+                self._bsg_label.setText(
+                    f"BSG-BAT: Background {round(bg_prob * 100)}% — likely not a bat"
+                )
+                self._bsg_label.setStyleSheet(
+                    "color: #e74c3c; font-size: 11px; padding: 0 2px;"
+                )
+            else:
+                self._bsg_label.setText("BSG-BAT: no confident ID")
+                self._bsg_label.setStyleSheet(
+                    "color: #888888; font-size: 11px; padding: 0 2px;"
+                )
+        else:
+            parts = "  ·  ".join(
+                f"{_BSG_NAMES.get(sp, sp)} {round(p * 100)}%"
+                for sp, p in hits[:3]
+            )
+            if bg_prob >= 0.50:
+                parts += f"  (Background {round(bg_prob * 100)}%)"
+            self._bsg_label.setText(f"BSG-BAT: {parts}")
+            colour = "#4caf50" if hits[0][1] >= 0.70 else "#ff9800"
+            self._bsg_label.setStyleSheet(
+                f"color: {colour}; font-size: 11px; padding: 0 2px;"
+            )
+
     # ── Workers ───────────────────────────────────────────────────────────────
     def _start_workers(self):
         threading.Thread(target=_save_and_analyse_worker, daemon=True).start()
@@ -1319,10 +1712,25 @@ class MainWindow(QMainWindow):
             args=(self._audio_enabled, self._volume),
             daemon=True,
         ).start()
+
+        # Load BSG-BAT models in the background so the app is immediately usable.
+        # Status messages go to the status bar; once loaded, the label updates.
+        def _load_bsg():
+            def _cb(msg):
+                SIGNALS.status.emit(msg)
+                if msg.endswith("ready ✓"):
+                    # Switch label from "loading…" to "ready" on the GUI thread
+                    SIGNALS.bsg_result.emit("__ready__", {})
+
+            BSG.load(status_cb=_cb)
+
+        threading.Thread(target=_load_bsg, daemon=True).start()
+
         SIGNALS.detection.connect(self._on_detection)
         SIGNALS.clip_spec.connect(self._on_clip_spec)
         SIGNALS.file_done.connect(self._on_file_done)
         SIGNALS.file_done.connect(lambda: self._file_btn.setEnabled(True))
+        SIGNALS.bsg_result.connect(self._on_bsg_result)
 
         # Output stream — open on whichever device is selected in the combo
         self._restart_output_stream(self._out_combo.currentData())
