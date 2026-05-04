@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         # Stores the last 50 clips as {ts: (spec, annotations)} in insertion order
         self._clip_cache: dict = {}
         self._pinned_ts: str | None = None   # None = live (always shows latest)
+        self._displayed_ts: str | None = None  # timestamp of whatever is on screen RIGHT NOW
 
         # Survey browser state
         self._survey_mode = False
@@ -997,6 +998,8 @@ class MainWindow(QMainWindow):
         """Render the high-resolution spectrogram of a clip,
         with BatDetect2 bounding boxes and species labels overlaid.
         """
+        self._displayed_ts = ts   # track exactly what's on screen for brightness controls
+
         # Remove previous annotation overlays
         for item in self._clip_boxes:
             self._clip_plot.removeItem(item)
@@ -1385,13 +1388,15 @@ class MainWindow(QMainWindow):
         self._brightness = 10.0 ** (-self._bright_step / 9.0)
         sign = "+" if self._bright_step > 0 else ""
         self._bright_label.setText(f"{sign}{self._bright_step}")
-        if self._clip_cache:
-            ts = self._pinned_ts or list(self._clip_cache.keys())[-1]
-            if ts in self._clip_cache:
-                spec, _ = self._clip_cache[ts]
-                clip_ceil = float(spec.max()) * self._brightness
-                self._clip_img.setImage(spec, autoLevels=False,
-                                        levels=(0.0, max(clip_ceil, 0.01)))
+        # Use _displayed_ts — the timestamp of whatever is actually on screen.
+        # Avoids the stale-cache-key bug where async BSG/clip_spec signals
+        # insert a different entry as the "last" key after the user has moved on.
+        ts = self._displayed_ts
+        if ts and ts in self._clip_cache:
+            spec, _ = self._clip_cache[ts]
+            clip_ceil = float(spec.max()) * self._brightness
+            self._clip_img.setImage(spec, autoLevels=False,
+                                    levels=(0.0, max(clip_ceil, 0.01)))
 
     def _brightness_up(self):
         if self._bright_step < 9:
@@ -1753,9 +1758,7 @@ class MainWindow(QMainWindow):
                     break
 
         # ── Update clip-panel label only for the currently displayed clip ─────
-        current_ts = self._pinned_ts or (
-            list(self._clip_cache.keys())[-1] if self._clip_cache else None
-        )
+        current_ts = self._pinned_ts or self._displayed_ts
         if ts != current_ts:
             return
 
