@@ -1011,14 +1011,13 @@ class MainWindow(QMainWindow):
         self._clip_img.setImage(spec, autoLevels=False,
                                 levels=(0.0, max(clip_ceil, 0.01)))
 
-        # Fit the view to the image extent
+        # Fit the view to the image extent — show full clip on load so nothing
+        # is hidden; user can scroll/pinch-zoom in to inspect individual calls
         n_frames, n_bins = spec.shape
         ms_per_frame = (CLIP_HOP / SAMPLE_RATE) * 1000.0   # ≈ 0.333 ms per frame
         total_ms     = n_frames * ms_per_frame
 
-        # Start zoomed to ~500 ms so individual call shapes are clearly visible
-        view_frames = min(n_frames, int(500.0 / ms_per_frame))
-        self._clip_plot.setXRange(0, view_frames, padding=0)
+        self._clip_plot.setXRange(0, n_frames, padding=0)
         self._clip_plot.setYRange(0, n_bins, padding=0)
 
         # Constrain scrolling to the actual clip extent
