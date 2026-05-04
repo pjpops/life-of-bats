@@ -138,11 +138,12 @@ _HP_SOS = butter(6, 15_000 / (SAMPLE_RATE / 2), btype="high", output="sos")
 
 # ── Cross-thread Qt signals ────────────────────────────────────────────────────
 class _Signals(QObject):
-    detection  = pyqtSignal(str, str, float)    # timestamp, species, confidence
-    status     = pyqtSignal(str)                # status bar message
-    file_done  = pyqtSignal()                   # file load finished → re-enable button
-    clip_spec  = pyqtSignal(object, str, object)  # spec array, timestamp, annotations
-    bsg_result = pyqtSignal(str, object)        # timestamp, {species: prob}
+    detection       = pyqtSignal(str, str, float)    # timestamp, species, confidence
+    status          = pyqtSignal(str)                # status bar message
+    file_done       = pyqtSignal()                   # file load finished → re-enable button
+    clip_spec       = pyqtSignal(object, str, object)  # spec array, timestamp, annotations
+    bsg_result      = pyqtSignal(str, object)        # timestamp, {species: prob}
+    bsg_file_result = pyqtSignal(str, object)        # wav_path_str, {species: prob} (survey)
 
 SIGNALS = _Signals()
 
@@ -279,6 +280,7 @@ class MainWindow(QMainWindow):
 
         # Survey browser state
         self._survey_mode = False
+        self._survey_row_map: dict[str, int] = {}   # wav_path_str → table row index
 
         # Clip accumulation (written only from audio callback thread)
         self._clip_active             = False
@@ -1105,7 +1107,10 @@ class MainWindow(QMainWindow):
     def _on_table_click(self, item: QTableWidgetItem):
         # ── Survey mode: load the WAV the row refers to ───────────────────────
         if self._survey_mode:
-            wav_str = item.data(Qt.UserRole)
+            # Always read wav path from column 0 of the clicked row so any
+            # column click (including the dynamically-filled BSG-BAT cell) works
+            col0 = self._table.item(item.row(), 0)
+            wav_str = col0.data(Qt.UserRole) if col0 else None
             if not wav_str:
                 self._table.clearSelection()
                 return
@@ -1191,18 +1196,21 @@ class MainWindow(QMainWindow):
         self._pinned_ts   = None
         self._clip_cache.clear()
 
-        # Switch to 4-column layout for survey mode
+        # Switch to 5-column layout for survey mode
         self._table.setRowCount(0)
-        self._table.setColumnCount(4)
-        self._table.setHorizontalHeaderLabels(["Time", "File", "Species detected", "Best conf."])
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(
+            ["Time", "File", "BatDetect2", "Conf.", "BSG-BAT"]
+        )
         hdr = self._table.horizontalHeader()
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
         hdr.setSectionResizeMode(1, QHeaderView.Fixed)
         hdr.setSectionResizeMode(2, QHeaderView.Stretch)
         hdr.setSectionResizeMode(3, QHeaderView.Fixed)
-        self._table.setColumnWidth(0, 72)
-        self._table.setColumnWidth(1, 200)
-        self._table.setColumnWidth(3, 80)
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+        self._table.setColumnWidth(0, 65)
+        self._table.setColumnWidth(1, 175)
+        self._table.setColumnWidth(3, 50)
 
         for ts, wav, all_anns, interesting_anns in entries:
             # Deduplicate: keep best confidence per species across all detections
@@ -1244,6 +1252,36 @@ class MainWindow(QMainWindow):
             conf_item = QTableWidgetItem(f"{round(top_conf * 100)}%")
             conf_item.setData(Qt.UserRole, str(wav))
             self._table.setItem(r, 3, conf_item)
+
+            # BSG-BAT column — placeholder until background thread fills it in
+            bsg_placeholder = QTableWidgetItem("…")
+            bsg_placeholder.setForeground(QColor("#555555"))
+            bsg_placeholder.setData(Qt.UserRole, str(wav))
+            self._table.setItem(r, 4, bsg_placeholder)
+
+        # Build wav → row map so BSG results can update the right cell
+        self._survey_row_map = {str(wav): idx for idx, (_, wav, _, _) in enumerate(entries)}
+
+        # Run BSG-BAT on every interesting file in a background thread.
+        # If models are still loading, the thread waits up to 2 minutes.
+        def _run_bsg_survey(entry_list):
+            wait = 0.0
+            while not BSG.available and not BSG.error and wait < 120:
+                time.sleep(0.5)
+                wait += 0.5
+            if not BSG.available:
+                return
+            for _, wav, _, _ in entry_list:
+                try:
+                    res = BSG.classify(str(wav))
+                    if res:
+                        SIGNALS.bsg_file_result.emit(str(wav), res)
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_run_bsg_survey, args=(entries,), daemon=True
+        ).start()
 
         n = len(entries)
         self._survey_banner.setText(
@@ -1304,6 +1342,7 @@ class MainWindow(QMainWindow):
         self._survey_mode = False
         self._pinned_ts   = None
         self._clip_cache.clear()
+        self._survey_row_map.clear()
         self._table.setRowCount(0)
         self._last_detection_ts = ""
         self._table.setColumnCount(3)
@@ -1646,15 +1685,27 @@ class MainWindow(QMainWindow):
         except queue.Empty:
             outdata[:, 0] = 0.0
 
-    # ── BSG-BAT result handler (Qt slot, GUI thread) ─────────────────────────
-    def _on_bsg_result(self, ts: str, results: dict):
-        """Display BSG-BAT species ID results in the clip panel label.
+    # ── BSG-BAT helpers ────────────────────────────────────────────────────────
+    @staticmethod
+    def _parse_bsg(results: dict):
+        """Return (hits, bg_prob).  hits = [(species_key, prob)] sorted desc, ≥35%."""
+        bg_prob = results.get("Background", 0.0)
+        hits = [
+            (sp, p) for sp, p in results.items()
+            if sp != "Background" and p >= 0.35
+        ]
+        hits.sort(key=lambda x: -x[1])
+        return hits, bg_prob
 
-        Only shown if the result belongs to the currently displayed clip
-        (live latest, or pinned).  Results from background clips are cached
-        but quietly ignored so the label always matches the visible call.
+    # ── BSG-BAT result handler — live clips (Qt slot, GUI thread) ─────────────
+    def _on_bsg_result(self, ts: str, results: dict):
+        """Handle a BSG-BAT result for a live clip.
+
+        Always annotates the matching separator row in the live detections table
+        so the result is visible even when another clip is pinned in Call Detail.
+        Only updates the clip-panel label when the result is for the shown clip.
         """
-        # Sentinel emitted when models finish loading
+        # ── Sentinels ─────────────────────────────────────────────────────────
         if ts == "__ready__":
             if not self._clip_cache:
                 self._bsg_label.setText("BSG-BAT: ready — waiting for first clip")
@@ -1663,34 +1714,54 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        # Only update if this result is for the clip currently on screen
+        if ts == "__error__":
+            err = results.get("msg", "load failed")
+            self._bsg_label.setText(f"BSG-BAT unavailable: {err}")
+            self._bsg_label.setStyleSheet(
+                "color: #e74c3c; font-size: 10px; padding: 0 2px;"
+            )
+            self._bsg_label.setToolTip(
+                "BSG-BAT models could not be loaded.\n"
+                "Check that ~/Desktop/bsgbat/ exists with models/ and code/ folders,\n"
+                "and that torch is installed in this venv."
+            )
+            return
+
+        hits, bg_prob = self._parse_bsg(results)
+
+        # ── Annotate separator row in live table ──────────────────────────────
+        if not self._survey_mode:
+            for row in range(self._table.rowCount()):
+                item = self._table.item(row, 0)
+                if item and f"── {ts} ──" in item.text() and "BSG:" not in item.text():
+                    if hits:
+                        top_name = _BSG_NAMES.get(hits[0][0], hits[0][0])
+                        bsg_str  = f"{top_name} {round(hits[0][1] * 100)}%"
+                        colour   = "#4caf50" if hits[0][1] >= 0.70 else "#ff9800"
+                    elif bg_prob >= 0.70:
+                        bsg_str = f"Background {round(bg_prob * 100)}%"
+                        colour  = "#e74c3c"
+                    else:
+                        bsg_str, colour = None, None
+                    if bsg_str:
+                        item.setText(f"── {ts} ──  ·  BSG: {bsg_str}")
+                        item.setForeground(QColor(colour))
+                    break
+
+        # ── Update clip-panel label only for the currently displayed clip ─────
         current_ts = self._pinned_ts or (
             list(self._clip_cache.keys())[-1] if self._clip_cache else None
         )
         if ts != current_ts:
             return
 
-        bg_prob = results.get("Background", 0.0)
-        hits = [
-            (sp, p)
-            for sp, p in results.items()
-            if sp != "Background" and p >= 0.35
-        ]
-        hits.sort(key=lambda x: -x[1])
-
         if not hits:
             if bg_prob >= 0.70:
-                self._bsg_label.setText(
-                    f"BSG-BAT: Background {round(bg_prob * 100)}% — likely not a bat"
-                )
-                self._bsg_label.setStyleSheet(
-                    "color: #e74c3c; font-size: 11px; padding: 0 2px;"
-                )
+                text   = f"BSG-BAT: Background {round(bg_prob * 100)}% — likely not a bat"
+                colour = "#e74c3c"
             else:
-                self._bsg_label.setText("BSG-BAT: no confident ID")
-                self._bsg_label.setStyleSheet(
-                    "color: #888888; font-size: 11px; padding: 0 2px;"
-                )
+                text   = "BSG-BAT: no confident ID"
+                colour = "#888888"
         else:
             parts = "  ·  ".join(
                 f"{_BSG_NAMES.get(sp, sp)} {round(p * 100)}%"
@@ -1698,11 +1769,46 @@ class MainWindow(QMainWindow):
             )
             if bg_prob >= 0.50:
                 parts += f"  (Background {round(bg_prob * 100)}%)"
-            self._bsg_label.setText(f"BSG-BAT: {parts}")
+            text   = f"BSG-BAT: {parts}"
             colour = "#4caf50" if hits[0][1] >= 0.70 else "#ff9800"
-            self._bsg_label.setStyleSheet(
-                f"color: {colour}; font-size: 11px; padding: 0 2px;"
+
+        self._bsg_label.setText(text)
+        self._bsg_label.setStyleSheet(
+            f"color: {colour}; font-size: 11px; padding: 0 2px;"
+        )
+
+    # ── BSG-BAT result handler — survey files (Qt slot, GUI thread) ───────────
+    def _on_bsg_file_result(self, wav_path_str: str, results: dict):
+        """Fill in the BSG-BAT column for a survey table row as results arrive."""
+        if not self._survey_mode:
+            return
+        row = self._survey_row_map.get(wav_path_str)
+        if row is None or row >= self._table.rowCount():
+            return
+
+        hits, bg_prob = self._parse_bsg(results)
+
+        if not hits:
+            if bg_prob >= 0.70:
+                text   = f"Background {round(bg_prob * 100)}%"
+                colour = "#e74c3c"
+            else:
+                text   = "—"
+                colour = "#555555"
+        else:
+            text   = "  ·  ".join(
+                f"{_BSG_NAMES.get(sp, sp)} {round(p * 100)}%"
+                for sp, p in hits[:2]
             )
+            colour = "#4caf50" if hits[0][1] >= 0.70 else "#ff9800"
+
+        col0    = self._table.item(row, 0)
+        wav_key = col0.data(Qt.UserRole) if col0 else wav_path_str
+
+        bsg_item = QTableWidgetItem(text)
+        bsg_item.setForeground(QColor(colour))
+        bsg_item.setData(Qt.UserRole, wav_key)
+        self._table.setItem(row, 4, bsg_item)
 
     # ── Workers ───────────────────────────────────────────────────────────────
     def _start_workers(self):
@@ -1714,15 +1820,20 @@ class MainWindow(QMainWindow):
         ).start()
 
         # Load BSG-BAT models in the background so the app is immediately usable.
-        # Status messages go to the status bar; once loaded, the label updates.
+        # Status messages go to the status bar; once loaded (or failed), the label updates.
         def _load_bsg():
             def _cb(msg):
                 SIGNALS.status.emit(msg)
-                if msg.endswith("ready ✓"):
-                    # Switch label from "loading…" to "ready" on the GUI thread
+                if "ready ✓" in msg:
                     SIGNALS.bsg_result.emit("__ready__", {})
+                elif "load failed" in msg or "failed" in msg.lower():
+                    SIGNALS.bsg_result.emit("__error__", {"msg": msg})
 
             BSG.load(status_cb=_cb)
+            # Fallback: if load() returned without firing either sentinel
+            if not BSG.available:
+                err = BSG.error or "unknown error — check BSG-BAT installation"
+                SIGNALS.bsg_result.emit("__error__", {"msg": err})
 
         threading.Thread(target=_load_bsg, daemon=True).start()
 
@@ -1731,6 +1842,7 @@ class MainWindow(QMainWindow):
         SIGNALS.file_done.connect(self._on_file_done)
         SIGNALS.file_done.connect(lambda: self._file_btn.setEnabled(True))
         SIGNALS.bsg_result.connect(self._on_bsg_result)
+        SIGNALS.bsg_file_result.connect(self._on_bsg_file_result)
 
         # Output stream — open on whichever device is selected in the combo
         self._restart_output_stream(self._out_combo.currentData())
