@@ -281,7 +281,8 @@ class MainWindow(QMainWindow):
 
         # Survey browser state
         self._survey_mode = False
-        self._survey_row_map: dict[str, int] = {}   # wav_path_str → table row index
+        self._survey_row_map: dict[str, int] = {}       # wav_path_str → table row index
+        self._survey_bsg_cancel = threading.Event()     # set to abort the BSG survey thread
 
         # Clip accumulation (written only from audio callback thread)
         self._clip_active             = False
@@ -1265,24 +1266,36 @@ class MainWindow(QMainWindow):
         self._survey_row_map = {str(wav): idx for idx, (_, wav, _, _) in enumerate(entries)}
 
         # Run BSG-BAT on every interesting file in a background thread.
-        # If models are still loading, the thread waits up to 2 minutes.
-        def _run_bsg_survey(entry_list):
+        # Cancel any previous survey BSG run first, then start a fresh one.
+        # The thread yields between files so the UI stays responsive.
+        self._survey_bsg_cancel.set()          # stop any previous thread
+        self._survey_bsg_cancel = threading.Event()   # fresh cancel token for this run
+        cancel = self._survey_bsg_cancel
+
+        def _run_bsg_survey(entry_list, cancel_ev):
+            # Wait up to 2 min for models to load, checking cancel every 0.5 s
             wait = 0.0
             while not BSG.available and not BSG.error and wait < 120:
+                if cancel_ev.is_set():
+                    return
                 time.sleep(0.5)
                 wait += 0.5
             if not BSG.available:
                 return
             for _, wav, _, _ in entry_list:
+                if cancel_ev.is_set():
+                    return
                 try:
                     res = BSG.classify(str(wav))
                     if res:
                         SIGNALS.bsg_file_result.emit(str(wav), res)
                 except Exception:
                     pass
+                # Brief pause between files so inference doesn't starve the UI
+                time.sleep(0.05)
 
         threading.Thread(
-            target=_run_bsg_survey, args=(entries,), daemon=True
+            target=_run_bsg_survey, args=(entries, cancel), daemon=True
         ).start()
 
         n = len(entries)
@@ -1327,12 +1340,8 @@ class MainWindow(QMainWindow):
 
                 SIGNALS.clip_spec.emit(spec, ts, annotations)
                 SIGNALS.status.emit(f"Loaded {wav_path.name}")
-
-                # BSG-BAT second opinion (non-blocking; skipped if models not ready)
-                if BSG.available:
-                    bsg = BSG.classify(str(wav_path))
-                    if bsg:
-                        SIGNALS.bsg_result.emit(ts, bsg)
+                # Note: BSG-BAT for survey files is handled by _run_bsg_survey;
+                # no separate classify call here to avoid double inference.
 
             except Exception as e:
                 SIGNALS.status.emit(f"Error loading {wav_path.name}: {e}")
@@ -1341,6 +1350,7 @@ class MainWindow(QMainWindow):
 
     def _exit_survey(self):
         """Leave survey mode and return to live monitoring."""
+        self._survey_bsg_cancel.set()   # stop background BSG thread immediately
         self._survey_mode = False
         self._pinned_ts   = None
         self._clip_cache.clear()
